@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""Independently audit the locked recurrent-codec development result.
+
+The auditor reads only the preregistration, recurrent result, optional captured
+stdout, prior codec result, their checksum sidecars, and locked implementation
+files.  It never opens a dataset payload.  A scientifically negative result is
+a valid result: the process exits nonzero only when integrity/replay checks fail.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+REPLAY_CONDITIONS = (
+    "native",
+    "oracle_code_gain0",
+    "oracle_code_coupled",
+    "oracle_code_paired_swapped",
+)
+CONTEXT_MODES = (
+    "original_unanswered_prefix",
+    "long_interruption_crossover",
+)
+PAIR_REPLAY_FIELDS = (
+    "partition",
+    "greedy_margin",
+    "sampled_margin",
+    "mean_teacher_forced_bpb",
+)
+SIDE_REPLAY_FIELDS = (
+    "greedy_hex",
+    "sampled_hex",
+    "greedy_probability_sha256",
+    "sampled_probability_sha256",
+)
+INPUT_HASH_NAMES = (
+    "train.bin",
+    "train.index.jsonl",
+    "dev_pairs.bin",
+    "dev_pairs.jsonl",
+)
+TRANSITION_SOURCE = Path(
+    "src/manifoldflow/dendritic_basin/future_turn_trajectory.py"
+)
+_TRANSITION_CONTROL_NEEDLES = (
+    "permutation = np.random.default_rng(seed).permutation(self.token_dim)",
+    "token_transition = self._transition[:, : self.token_dim][:, permutation]",
+    "return self._assemble_transition(token_transition)",
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} does not contain a JSON object")
+    return value
+
+
+def _sidecar_path(path: Path) -> Path:
+    return path.with_name(path.name + ".sha256")
+
+
+def _locked_path_is_absolute(value: str) -> bool:
+    """Recognize a locked POSIX path even when auditing from Windows."""
+
+    return value.startswith("/") or Path(value).is_absolute()
+
+
+def verify_sidecar(path: Path) -> dict[str, Any]:
+    """Verify ``path`` against its adjacent GNU-style SHA-256 sidecar."""
+
+    sidecar = _sidecar_path(path)
+    text = sidecar.read_text(encoding="utf-8").strip()
+    fields = text.split()
+    if not fields or not _SHA256.fullmatch(fields[0].lower()):
+        raise ValueError(f"invalid SHA-256 sidecar: {sidecar}")
+    declared = fields[0].lower()
+    if len(fields) >= 2 and fields[-1].lstrip("*") != path.name:
+        raise ValueError(f"sidecar filename does not name {path.name}")
+    actual = _sha256_file(path)
+    return {
+        "path": str(path),
+        "sidecar": str(sidecar),
+        "declared_sha256": declared,
+        "actual_sha256": actual,
+        "matches": declared == actual,
+    }
+
+
+@dataclass
+class CheckBook:
+    records: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def add(
+        self,
+        label: str,
+        passed: bool,
+        *,
+        expected: Any = None,
+        actual: Any = None,
+        detail: str | None = None,
+    ) -> None:
+        if label in self.records:
+            raise ValueError(f"duplicate audit check: {label}")
+        row: dict[str, Any] = {"passed": bool(passed)}
+        if expected is not None:
+            row["expected"] = expected
+        if actual is not None:
+            row["actual"] = actual
+        if detail is not None:
+            row["detail"] = detail
+        self.records[label] = row
+
+    def equal(self, label: str, actual: Any, expected: Any) -> None:
+        self.add(label, actual == expected, expected=expected, actual=actual)
+
+    def true(self, label: str, actual: Any) -> None:
+        self.add(label, actual is True, expected=True, actual=actual)
+
+    @property
+    def passed(self) -> bool:
+        return all(row["passed"] for row in self.records.values())
+
+    @property
+    def failures(self) -> list[str]:
+        return [label for label, row in self.records.items() if not row["passed"]]
+
+
+def _rows_by_id(mode: dict[str, Any], condition: str) -> dict[str, dict[str, Any]]:
+    rows = mode["pair_rows"][condition]
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        pair_id = str(row["pair_id"])
+        if pair_id in result:
+            raise ValueError(f"duplicate pair row for {condition}: {pair_id}")
+        result[pair_id] = row
+    return result
+
+
+def compare_exact_replay(
+    result: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    """Compare every locked generated byte/probability path and BPB exactly."""
+
+    mismatches: list[str] = []
+    compared_rows = 0
+    compared_sides = 0
+    compared_fields = 0
+    result_modes = result["evaluation"]["context_modes"]
+    reference_modes = reference["evaluation"]["context_modes"]
+    for mode_name in CONTEXT_MODES:
+        current_mode = result_modes[mode_name]
+        prior_mode = reference_modes[mode_name]
+        if current_mode.get("available") is not True:
+            mismatches.append(f"{mode_name}: recurrent mode unavailable")
+            continue
+        if prior_mode.get("available") is not True:
+            mismatches.append(f"{mode_name}: reference mode unavailable")
+            continue
+        for condition in REPLAY_CONDITIONS:
+            current = _rows_by_id(current_mode, condition)
+            prior = _rows_by_id(prior_mode, condition)
+            if list(current) != list(prior):
+                mismatches.append(f"{mode_name}/{condition}: pair ID/order mismatch")
+            for pair_id in sorted(set(current) | set(prior)):
+                if pair_id not in current or pair_id not in prior:
+                    mismatches.append(
+                        f"{mode_name}/{condition}/{pair_id}: missing pair row"
+                    )
+                    continue
+                compared_rows += 1
+                current_row = current[pair_id]
+                prior_row = prior[pair_id]
+                for field_name in PAIR_REPLAY_FIELDS:
+                    compared_fields += 1
+                    if current_row.get(field_name) != prior_row.get(field_name):
+                        mismatches.append(
+                            f"{mode_name}/{condition}/{pair_id}/{field_name}"
+                        )
+                for side_name in ("a", "b"):
+                    compared_sides += 1
+                    current_side = current_row["sides"][side_name]
+                    prior_side = prior_row["sides"][side_name]
+                    for field_name in SIDE_REPLAY_FIELDS:
+                        compared_fields += 1
+                        if current_side.get(field_name) != prior_side.get(field_name):
+                            mismatches.append(
+                                f"{mode_name}/{condition}/{pair_id}/"
+                                f"{side_name}/{field_name}"
+                            )
+    return {
+        "passed": not mismatches,
+        "context_modes": list(CONTEXT_MODES),
+        "conditions": list(REPLAY_CONDITIONS),
+        "compared_pair_condition_rows": compared_rows,
+        "compared_side_condition_rows": compared_sides,
+        "compared_exact_fields": compared_fields,
+        "mismatch_count": len(mismatches),
+        "first_mismatches": mismatches[:50],
+    }
+
+
+def _positive_interval(record: dict[str, Any], expected_pairs: int) -> bool:
+    values = (
+        record.get("mean"),
+        record.get("ci95_low"),
+        record.get("ci95_high"),
+    )
+    return (
+        record.get("pairs") == expected_pairs
+        and all(isinstance(value, (int, float)) for value in values)
+        and all(math.isfinite(float(value)) for value in values)
+        and float(record["ci95_low"]) > 0.0
+    )
+
+
+def audit_transition_shuffle_protocol(
+    preregistration: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Separate protocol semantics from otherwise-valid hash/replay integrity."""
+
+    declared = str(
+        preregistration.get("context_protocol", {}).get(
+            "transition_shuffle_control", ""
+        )
+    )
+    source_path = repo_root / TRANSITION_SOURCE
+    source_lines = source_path.read_text(encoding="utf-8").splitlines()
+    evidence = []
+    for needle in _TRANSITION_CONTROL_NEEDLES:
+        line = next(
+            (
+                index
+                for index, text in enumerate(source_lines, start=1)
+                if needle in text
+            ),
+            None,
+        )
+        evidence.append({"line": line, "text": needle, "present": line is not None})
+    output_coordinate_permutation = all(item["present"] for item in evidence)
+    declared_successor_shuffle = "successor shuffling" in declared.lower()
+
+    role_binding: dict[str, Any] = {}
+    for mode_name in CONTEXT_MODES:
+        mode = result.get("evaluation", {}).get("context_modes", {}).get(mode_name, {})
+        diagnostics = mode.get("forecast_diagnostics", {})
+        full_fraction = diagnostics.get("recurrent_full_history", {}).get(
+            "predicted_assistant_role_fraction"
+        )
+        shuffled_fraction = diagnostics.get("recurrent_transition_shuffled", {}).get(
+            "predicted_assistant_role_fraction"
+        )
+        role_binding[mode_name] = {
+            "recurrent_full_history_assistant_role_fraction": full_fraction,
+            "transition_shuffled_assistant_role_fraction": shuffled_fraction,
+            "absolute_drop": (
+                float(full_fraction) - float(shuffled_fraction)
+                if full_fraction is not None and shuffled_fraction is not None
+                else None
+            ),
+        }
+
+    semantic_deviation = declared_successor_shuffle and output_coordinate_permutation
+    return {
+        "declared_control": declared,
+        "locked_implementation_control": (
+            "Permutes the fitted next-token transition's output coordinates, then "
+            "reassembles the analytic recurrent-history update; it does not refit "
+            "on within-conversation shuffled successor pairs."
+        ),
+        "implementation_source": str(TRANSITION_SOURCE).replace("\\", "/"),
+        "implementation_evidence": evidence,
+        "declared_successor_pair_shuffle": declared_successor_shuffle,
+        "detected_output_coordinate_permutation": output_coordinate_permutation,
+        "semantic_deviation": semantic_deviation,
+        "integrity_impact": (
+            "none; the locked implementation hash and exact reference replay "
+            "remain valid"
+        ),
+        "scientific_impact": (
+            "The arm tests whether correctly aligned transition/code coordinates are "
+            "causal, but cannot satisfy the preregistered ordered-successor-"
+            "learning gate."
+        ),
+        "role_binding_evidence": role_binding,
+        "ordered_successor_gate_eligible": not semantic_deviation,
+    }
+
+
+def compute_locked_gates(
+    result: dict[str, Any],
+    preregistration: dict[str, Any],
+    *,
+    ordered_successor_control_eligible: bool = True,
+) -> dict[str, Any]:
+    """Compute the preregistered causal-code, history, and health gates."""
+
+    primary_spec = preregistration["primary_causal_code_gate"]
+    mode_name = str(primary_spec["mode"])
+    partition = str(primary_spec["partition"])
+    expected_pairs = int(
+        preregistration["locked_inputs"]["expected_fixed_partition_counts"][partition]
+    )
+    mode = result["evaluation"]["context_modes"][mode_name]
+    summary = mode["summaries"][partition]
+    contrasts = summary["controlled_contrasts"]
+    arms = summary["arms"]
+
+    primary_interval = contrasts["recurrent_coupled_minus_paired_swap"][
+        "sampled_free_generation_margin_difference"
+    ]
+    primary_effect_pass = _positive_interval(primary_interval, expected_pairs)
+    collision = mode["code_control_collision_audit"]["recurrent_full_history"]
+    distinct_fraction = float(collision["paired_swap_distinct_code_fraction"])
+    code_pass = (
+        int(collision["paired_swap_pairs"])
+        == int(
+            preregistration["locked_inputs"][
+                "expected_development_pairs_after_exclusion"
+            ]
+        )
+        and distinct_fraction >= 0.95
+    )
+
+    native_health = arms["native"]["sampled_degeneration"]
+    recurrent_health = arms["recurrent_code_coupled"]["sampled_degeneration"]
+    printable_loss = float(native_health["mean_printable_fraction"]) - float(
+        recurrent_health["mean_printable_fraction"]
+    )
+    utf8_loss = float(native_health["valid_utf8_fraction"]) - float(
+        recurrent_health["valid_utf8_fraction"]
+    )
+    added_long_runs = int(recurrent_health["outputs_with_run_at_least_16"]) - int(
+        native_health["outputs_with_run_at_least_16"]
+    )
+    health_pass = printable_loss <= 0.05 and utf8_loss <= 0.05 and added_long_runs <= 2
+    primary_pass = primary_effect_pass and code_pass and health_pass
+
+    history_intervals = {
+        "full_minus_current_user_only": contrasts[
+            "recurrent_coupled_minus_current_user_only"
+        ]["sampled_free_generation_margin_difference"],
+        "full_minus_transition_shuffled": contrasts[
+            "recurrent_coupled_minus_transition_shuffle"
+        ]["sampled_free_generation_margin_difference"],
+    }
+    raw_history_effects = {
+        name: _positive_interval(value, expected_pairs)
+        for name, value in history_intervals.items()
+    }
+    current_user_history_pass = raw_history_effects["full_minus_current_user_only"]
+    raw_transition_effect_pass = raw_history_effects[
+        "full_minus_transition_shuffled"
+    ]
+    ordered_successor_pass = (
+        raw_transition_effect_pass and ordered_successor_control_eligible
+    )
+    history_pass = current_user_history_pass and ordered_successor_pass
+    return {
+        "endpoint": {
+            "mode": mode_name,
+            "partition": partition,
+            "pairs": expected_pairs,
+            "free_generation_primary": True,
+        },
+        "primary_causal_code": {
+            "effect_interval": primary_interval,
+            "positive_interval_passed": primary_effect_pass,
+            "paired_code_distinct_fraction": distinct_fraction,
+            "code_control_passed": code_pass,
+            "health": {
+                "native": native_health,
+                "recurrent": recurrent_health,
+                "printable_fraction_loss": printable_loss,
+                "valid_utf8_fraction_loss": utf8_loss,
+                "added_outputs_with_run_at_least_16": added_long_runs,
+                "passed": health_pass,
+            },
+            "passed": primary_pass,
+        },
+        "recurrent_history": {
+            "intervals": history_intervals,
+            "raw_positive_interval_passed": raw_history_effects,
+            "historical_context_contribution": {
+                "effect_interval": history_intervals["full_minus_current_user_only"],
+                "positive_interval_passed": current_user_history_pass,
+                "passed": current_user_history_pass,
+            },
+            "ordered_successor_learning": {
+                "effect_interval": history_intervals["full_minus_transition_shuffled"],
+                "raw_positive_interval_passed": raw_transition_effect_pass,
+                "control_semantically_eligible": ordered_successor_control_eligible,
+                "passed": ordered_successor_pass,
+                "reason": (
+                    "eligible preregistered successor-pair shuffle"
+                    if ordered_successor_control_eligible
+                    else "locked arm permutes output coordinates rather than refitting "
+                    "on shuffled successor pairs"
+                ),
+            },
+            "full_preregistered_gate_passed": history_pass,
+            "passed": history_pass,
+        },
+        "partial_mechanism_evidence": {
+            "primary_causal_code_passed": primary_pass,
+            "historical_context_contribution_passed": current_user_history_pass,
+            "ordered_successor_learning_established": ordered_successor_pass,
+        },
+        "mechanism_advancement_passed": primary_pass and history_pass,
+    }
+
+
+def _validate_expected_structure(
+    checks: CheckBook,
+    preregistration: dict[str, Any],
+    result: dict[str, Any],
+    reference: dict[str, Any],
+) -> None:
+    locked_inputs = preregistration["locked_inputs"]
+    checks.equal("result/schema_version", result.get("schema_version"), 1)
+    checks.equal(
+        "result/experiment",
+        result.get("experiment"),
+        "future_turn_recurrent_codec_native500_development",
+    )
+    checks.equal("result/status", result.get("status"), "complete_development")
+    checks.equal("result/not_smoke", result["config"].get("smoke"), False)
+
+    expected_inputs = {name: locked_inputs[name] for name in INPUT_HASH_NAMES}
+    checks.equal(
+        "inputs/verified_hashes", result.get("verified_inputs"), expected_inputs
+    )
+    checks.equal(
+        "checkpoint/path",
+        result["checkpoint"].get("path"),
+        locked_inputs["checkpoint_path"],
+    )
+    checks.equal(
+        "checkpoint/sha256",
+        result["checkpoint"].get("sha256"),
+        locked_inputs["checkpoint_sha256"],
+    )
+    checks.equal(
+        "checkpoint/frozen_embodied_bytes",
+        result["checkpoint"].get("transient_embodied_bytes_at_report"),
+        result["checkpoint"].get("embodied_bytes_at_load"),
+    )
+    checks.equal(
+        "checkpoint/matches_prior_embodied_bytes",
+        result["checkpoint"].get("embodied_bytes_at_load"),
+        reference["checkpoint"].get("embodied_bytes_at_load"),
+    )
+
+    count_map = {
+        "training_conversations": "expected_training_conversations",
+        "training_role_tagged_events": "expected_role_tagged_training_events",
+        "adjacent_training_event_transitions": (
+            "expected_adjacent_training_event_transitions"
+        ),
+        "completed_training_assistant_turns": "expected_completed_assistant_turns",
+        "decoder_target_bytes_one_pass": "expected_capped_decoder_target_bytes",
+        "development_pairs": "expected_development_pairs_after_exclusion",
+    }
+    for report_name, locked_name in count_map.items():
+        checks.equal(
+            f"counts/{report_name}",
+            result["counts"].get(report_name),
+            locked_inputs[locked_name],
+        )
+    checks.equal(
+        "counts/development_sides",
+        result["counts"].get("development_sides"),
+        2 * int(locked_inputs["expected_development_pairs_after_exclusion"]),
+    )
+    checks.equal(
+        "counts/partitions",
+        result["evaluation"].get("development_partition_counts"),
+        locked_inputs["expected_fixed_partition_counts"],
+    )
+
+    locked_config = preregistration["locked_config"]
+    direct_config = {
+        "raw_dimensions": "raw_dimensions",
+        "content_dimensions": "content_dimensions",
+        "active_content_features": "active_content_features",
+        "causal_hash_dimensions": "causal_hash_dimensions_per_input_timescale",
+        "one_shot_ridge_alpha": "one_shot_ridge_alpha",
+        "memory_decay": "recurrent_memory_decay",
+        "transition_ridge": "recurrent_transition_ridge",
+        "future_slots": "future_slots",
+        "table_bits": "writer_table_bits",
+        "learning_rate": "writer_learning_rate",
+        "local_orders": "writer_local_orders",
+        "decoder_training_passes": "decoder_training_passes",
+        "response_cap": "response_cap",
+        "generation_horizon": "generation_horizon",
+        "gain": "gain",
+        "residual_clip": "residual_clip",
+        "training_seed": "training_seed",
+        "sample_seed": "sample_seed",
+        "control_seed": "control_seed",
+        "transition_shuffle_seed": "transition_shuffle_seed",
+        "bootstrap_seed": "bootstrap_seed",
+        "bootstrap_resamples": "bootstrap_resamples",
+    }
+    for report_name, locked_name in direct_config.items():
+        checks.equal(
+            f"config/{report_name}",
+            result["config"].get(report_name),
+            locked_config[locked_name],
+        )
+    checks.equal(
+        "config/persistent_features",
+        result["codec"].get("sparse_persistent_features"),
+        locked_config["persistent_features_including_role_and_source"],
+    )
+    wall = result.get("wall_seconds")
+    checks.add(
+        "config/wall_limit",
+        isinstance(wall, (int, float))
+        and math.isfinite(float(wall))
+        and 0.0
+        < float(wall)
+        <= float(locked_config["wall_limit_seconds_report_check"]),
+        expected=f"(0, {locked_config['wall_limit_seconds_report_check']}]",
+        actual=wall,
+    )
+    checks.equal(
+        "config/excluded_engineering_pairs",
+        result["config"].get("excluded_development_pair_ids"),
+        locked_inputs["excluded_engineering_pair_ids"],
+    )
+
+    required_claims = (
+        "anchored_codec_and_decoder_reused_unchanged",
+        "recurrent_input_is_prior_role_tagged_turn_vectors",
+        "transition_target_is_next_observed_turn_vector",
+        "deterministic_conditional_mean_baseline",
+        "one_future_slot_only",
+        "native_checkpoint_frozen",
+        "actual_free_bytes_generated",
+        "free_generation_primary",
+    )
+    for name in required_claims:
+        checks.true(f"claim/{name}", result["claim_scope"].get(name))
+    checks.equal(
+        "claim/no_recursive_rollout_training",
+        result["claim_scope"].get("trained_through_recursive_rollout"),
+        False,
+    )
+    checks.equal(
+        "claim/no_particle_future",
+        result["claim_scope"].get("particle_or_distributional_future"),
+        False,
+    )
+    checks.equal(
+        "claim/no_goal_learning",
+        result["claim_scope"].get("goal_or_preference_learning"),
+        False,
+    )
+
+    evaluation = result["evaluation"]
+    for name in (
+        "writer_fingerprints_unchanged_by_evaluation",
+        "recurrent_transition_unchanged_by_evaluation",
+        "transient_recurrent_state_reset_after_evaluation",
+    ):
+        checks.true(f"evaluation/{name}", evaluation.get(name))
+    for mode_name in CONTEXT_MODES:
+        mode = evaluation["context_modes"][mode_name]
+        checks.true(f"evaluation/{mode_name}/available", mode.get("available"))
+        checks.equal(
+            f"evaluation/{mode_name}/gain0_rows_exactly_native",
+            mode["pair_rows"].get("oracle_code_gain0"),
+            mode["pair_rows"].get("native"),
+        )
+        for name, value in mode["invariants"].items():
+            checks.true(f"evaluation/{mode_name}/invariant/{name}", value)
+        for condition, rows in mode["pair_rows"].items():
+            checks.equal(
+                f"evaluation/{mode_name}/{condition}/row_count",
+                len(rows),
+                locked_inputs["expected_development_pairs_after_exclusion"],
+            )
+
+    checks.equal("decoder_training/passes", result["decoder_training"].get("passes"), 1)
+    checks.true(
+        "decoder_training/matched_updates",
+        result["decoder_training"].get("matched_episode_and_symbol_updates"),
+    )
+    for name in (
+        "conversation_order_sha256",
+        "observed_response_sequence_sha256",
+    ):
+        checks.equal(
+            f"decoder_training/reproduces_reference/{name}",
+            result["decoder_training"].get(name),
+            reference["decoder_training"].get(name),
+        )
+    checks.equal(
+        "codec/dense_code_reproduces_reference",
+        result["codec"].get("dense_code_sha256"),
+        reference["codec"].get("dense_code_sha256"),
+    )
+    for writer_name, writer in result["decoder_training"]["writers"].items():
+        checks.equal(
+            f"decoder_training/{writer_name}/episodes",
+            writer.get("episodes"),
+            locked_inputs["expected_completed_assistant_turns"],
+        )
+        checks.equal(
+            f"decoder_training/{writer_name}/symbols",
+            writer.get("symbols"),
+            locked_inputs["expected_capped_decoder_target_bytes"],
+        )
+    checks.true(
+        "decoder_allocation/matched_tables",
+        result["decoder_allocation"].get("all_weight_tables_allocation_matched"),
+    )
+    checks.true(
+        "decoder_allocation/matched_active_count",
+        result["decoder_allocation"].get("additive_and_coupled_active_count_matched"),
+    )
+    fingerprint = result["recurrent_transition"].get("fitted_fingerprint")
+    checks.add(
+        "recurrent_transition/fingerprint_reported",
+        isinstance(fingerprint, str) and _SHA256.fullmatch(fingerprint) is not None,
+        expected="64 lowercase hexadecimal characters",
+        actual=fingerprint,
+    )
+
+
+def _validate_implementation_and_runtime(
+    checks: CheckBook,
+    preregistration: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    locked = preregistration["locked_implementation"]
+    reported = result["implementation_files"]
+    local_records: dict[str, Any] = {}
+    for name, row in reported.items():
+        checks.equal(
+            f"implementation/report/{name}", row.get("sha256"), locked.get(name)
+        )
+    for name, expected in locked.items():
+        candidate = Path(name)
+        cross_host_posix = name.startswith("/") and not candidate.is_absolute()
+        if not _locked_path_is_absolute(name):
+            candidate = repo_root / candidate
+        if not cross_host_posix and candidate.exists():
+            actual = _sha256_file(candidate)
+            checks.equal(f"implementation/local/{name}", actual, expected)
+            local_records[name] = {
+                "path": str(candidate),
+                "sha256": actual,
+                "independently_rehashed": True,
+            }
+        else:
+            local_records[name] = {
+                "path": str(candidate),
+                "independently_rehashed": False,
+            }
+
+    absolute_native = [name for name in locked if _locked_path_is_absolute(name)]
+    checks.equal("native_runtime/one_locked_absolute_binary", len(absolute_native), 1)
+    native_name = absolute_native[0] if len(absolute_native) == 1 else ""
+    native = result["native_runtime"]
+    checks.equal(
+        "native_runtime/resolved_path", native.get("resolved_path"), native_name
+    )
+    checks.equal("native_runtime/sha256", native.get("sha256"), locked.get(native_name))
+    checks.add(
+        "native_runtime/bytes_reported",
+        isinstance(native.get("bytes"), int) and int(native["bytes"]) > 0,
+        expected="positive integer",
+        actual=native.get("bytes"),
+    )
+    version = native.get("version")
+    checks.add(
+        "native_runtime/version_reported",
+        isinstance(version, str) and bool(version.strip()),
+        expected="nonempty string",
+        actual=version,
+    )
+    checks.add(
+        "native_runtime/override_flags_are_boolean",
+        isinstance(native.get("alm_native_dll_override_set"), bool)
+        and isinstance(native.get("loaded_via_override"), bool),
+        actual={
+            "alm_native_dll_override_set": native.get("alm_native_dll_override_set"),
+            "loaded_via_override": native.get("loaded_via_override"),
+        },
+    )
+    return local_records
+
+
+def audit_loaded_reports(
+    preregistration: dict[str, Any],
+    result: dict[str, Any],
+    reference: dict[str, Any],
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Audit already-loaded JSON objects without touching dataset payloads."""
+
+    checks = CheckBook()
+    _validate_expected_structure(checks, preregistration, result, reference)
+    implementation = _validate_implementation_and_runtime(
+        checks, preregistration, result, repo_root=repo_root
+    )
+    replay = compare_exact_replay(result, reference)
+    checks.true("exact_reference_replay", replay["passed"])
+    transition_protocol = audit_transition_shuffle_protocol(
+        preregistration, result, repo_root=repo_root
+    )
+    gates = compute_locked_gates(
+        result,
+        preregistration,
+        ordered_successor_control_eligible=transition_protocol[
+            "ordered_successor_gate_eligible"
+        ],
+    )
+    partial = gates["partial_mechanism_evidence"]
+    status = (
+        "invalid_integrity"
+        if not checks.passed
+        else "valid_mechanism_advanced"
+        if gates["mechanism_advancement_passed"]
+        else "valid_primary_and_history_supported_ordered_successor_unresolved"
+        if (
+            partial["primary_causal_code_passed"]
+            and partial["historical_context_contribution_passed"]
+            and transition_protocol["semantic_deviation"]
+        )
+        else "valid_gates_not_all_passed"
+    )
+    return {
+        "schema_version": 1,
+        "task": "future_turn_recurrent_codec_native500_independent_audit",
+        "status": status,
+        "integrity_passed": checks.passed,
+        "integrity_failures": checks.failures,
+        "checks": checks.records,
+        "local_implementation_hashes": implementation,
+        "exact_reference_replay": replay,
+        "transition_shuffle_protocol_audit": transition_protocol,
+        "locked_gates": gates,
+        "scope": {
+            "dataset_payloads_opened": False,
+            "free_generation_is_primary": True,
+            "negative_scientific_result_is_not_an_integrity_failure": True,
+            "no_farther_horizon_or_goal_claim": True,
+        },
+    }
+
+
+def audit_files(
+    preregistration_path: Path,
+    result_path: Path,
+    *,
+    repo_root: Path,
+    reference_path: Path | None = None,
+    stdout_path: Path | None = None,
+) -> dict[str, Any]:
+    """Verify file hashes, load reports, and perform the independent audit."""
+
+    preregistration = _read_json(preregistration_path)
+    if reference_path is None:
+        reference_path = (
+            repo_root / preregistration["integrity_gate"]["reference_codec_result_path"]
+        )
+    result = _read_json(result_path)
+    reference = _read_json(reference_path)
+    audit = audit_loaded_reports(
+        preregistration, result, reference, repo_root=repo_root
+    )
+    file_checks = CheckBook()
+    sidecars: dict[str, Any] = {}
+    for label, path in (
+        ("preregistration", preregistration_path),
+        ("result", result_path),
+        ("reference", reference_path),
+    ):
+        try:
+            record = verify_sidecar(path)
+        except (OSError, ValueError) as error:
+            record = {"path": str(path), "matches": False, "error": str(error)}
+        sidecars[label] = record
+        file_checks.true(f"sidecar/{label}", record.get("matches"))
+    file_checks.equal(
+        "reference/preregistered_sha256",
+        sidecars["reference"].get("actual_sha256"),
+        preregistration["integrity_gate"]["reference_codec_result_sha256"],
+    )
+
+    if stdout_path is not None:
+        try:
+            stdout_record = verify_sidecar(stdout_path)
+        except (OSError, ValueError) as error:
+            stdout_record = {
+                "path": str(stdout_path),
+                "matches": False,
+                "error": str(error),
+            }
+        sidecars["stdout"] = stdout_record
+        file_checks.true("sidecar/stdout", stdout_record.get("matches"))
+        same = stdout_path.read_bytes() == result_path.read_bytes()
+        file_checks.true("stdout/exactly_matches_result", same)
+    else:
+        sidecars["stdout"] = {"provided": False, "required": False}
+
+    combined_pass = audit["integrity_passed"] and file_checks.passed
+    audit["artifact_hashes"] = sidecars
+    audit["file_checks"] = file_checks.records
+    audit["integrity_failures"] = [
+        *audit["integrity_failures"],
+        *file_checks.failures,
+    ]
+    audit["integrity_passed"] = combined_pass
+    partial = audit["locked_gates"]["partial_mechanism_evidence"]
+    audit["status"] = (
+        "invalid_integrity"
+        if not combined_pass
+        else "valid_mechanism_advanced"
+        if audit["locked_gates"]["mechanism_advancement_passed"]
+        else "valid_primary_and_history_supported_ordered_successor_unresolved"
+        if (
+            partial["primary_causal_code_passed"]
+            and partial["historical_context_contribution_passed"]
+            and audit["transition_shuffle_protocol_audit"]["semantic_deviation"]
+        )
+        else "valid_gates_not_all_passed"
+    )
+    audit["opened_files"] = [
+        str(preregistration_path),
+        str(_sidecar_path(preregistration_path)),
+        str(result_path),
+        str(_sidecar_path(result_path)),
+        str(reference_path),
+        str(_sidecar_path(reference_path)),
+        *(
+            [str(stdout_path), str(_sidecar_path(stdout_path))]
+            if stdout_path is not None
+            else []
+        ),
+        *[
+            record["path"]
+            for record in audit["local_implementation_hashes"].values()
+            if record["independently_rehashed"]
+        ],
+    ]
+    return audit
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preregistration", type=Path, required=True)
+    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--reference-result", type=Path)
+    parser.add_argument("--stdout-result", type=Path)
+    parser.add_argument("--audit", type=Path, required=True)
+    parser.add_argument(
+        "--repo-root", type=Path, default=Path(__file__).resolve().parents[1]
+    )
+    return parser
+
+
+def write_audit_artifact(path: Path, audit: dict[str, Any]) -> str:
+    """Write canonical UTF-8 bytes and a checksum of those exact bytes."""
+
+    payload = json.dumps(audit, indent=2) + "\n"
+    encoded = payload.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encoded)
+    _sidecar_path(path).write_bytes(
+        f"{_sha256(encoded)}  {path.name}\n".encode()
+    )
+    return payload
+
+
+def main() -> None:
+    args = _parser().parse_args()
+    audit = audit_files(
+        args.preregistration,
+        args.result,
+        repo_root=args.repo_root.resolve(),
+        reference_path=args.reference_result,
+        stdout_path=args.stdout_result,
+    )
+    payload = write_audit_artifact(args.audit, audit)
+    print(payload, end="")
+    if not audit["integrity_passed"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
